@@ -1,7 +1,7 @@
 from airflow import DAG
-from airflow.operators.python_operator import PythonOperator
-from airflow.operators.python import BranchPythonOperator, get_current_context
-from airflow.operators.dummy_operator import DummyOperator
+from airflow.operators.python import PythonOperator, get_current_context
+from airflow.operators.python_operator import BranchPythonOperator
+from airflow.operators.dummy import DummyOperator
 from airflow.operators.http_operator import SimpleHttpOperator
 
 from airflow.utils.task_group import TaskGroup
@@ -21,22 +21,24 @@ git_inputs = {
     "project_repo": "https://github.com/MatrixManAtYrService/dummyproject",
     # between these revisions
     "project_reference_rev": "a443c6f",
-    "project_candidate_rev": "latest",
+    "project_candidate_rev": "master",
     # according to these tests
-    "tests_repo": "https://github.com/MatrixManAtYrService/dummyproject-tests",
-    "tests_rev": "latest",
+    "tests_repo": "https://github.com/MatrixManAtYrService/dummyproject-test",
+    "tests_rev": "master",
 }
 
 # keys by type
-revisions = [x[:-4] for x in git_inputs if re.match(r".*rev$", x)]
+revisions = [x for x in git_inputs if re.match(r".*rev$", x)]
 repositories = [x[:-5] for x in git_inputs if re.match(r".*repo$", x)]
 
 
-def gen_github_apis(user_inputs_json):
+def gen_github_endpoints(user_inputs_json):
     "Generate github api endpoints for each repo"
 
     user_inputs = json.loads(user_inputs_json)
 
+    # build endpoints
+    xcom = {}
     for repo in repositories:
 
         repo_key = f"{repo}_repo"
@@ -48,39 +50,44 @@ def gen_github_apis(user_inputs_json):
         owner = match.group(1)
         name = match.group(2)
 
-        # store api endpoint
-        ti = get_current_context()["ti"]
-        ti.xcom_push(
-            key=f"{repo}_api", value=f"https://api.github.com/repos/{owner}/{name}"
-        )
+        for revision in revisions:
+            rev_reference = user_inputs[revision]
+            if repo in revision:
+                xcom[revision] = f"/repos/{owner}/{name}/commits/{rev_reference}"
+
+    return xcom
 
 
-def maybe_dereference_rev(user_inputs_json, revision):
+def decide_dereference_rev(revision_endpoint, decision):
     "Skip api call if SHA1 is explicitly given"
 
-    user_inputs = json.loads(user_inputs_json)
-    rev_key = f"{revision}_rev"
-    rev_reference = user_inputs[rev_key]
-    if rev_reference.lower().strip() == "latest":
-        return f"fix_{revision}"
+    yes = decision["branch"]
+    no = decision["sha1"]
+
+    "None comes in as empty string"
+    if "/" not in revision_endpoint:
+        return no
     else:
-        return "solidify_params"
+        return yes
 
 
-def solidify_params(user_inputs_json):
+def branch_to_sha1(revision, response, ti):
+    "Given a github '/repos/foo/bar/commits' response, extract the SHA1"
+
+    sha = json.loads(response)["sha"]
+    ti.xcom_push(key=f"{revision}_sha", value=sha)
+
+
+def solidify_params(user_inputs_json, ti):
     "Write nonambiguous params"
 
     user_inputs = json.loads(user_inputs_json)
-    ti = get_current_context()["ti"]
 
+    # update revision references with nontemporal ones
     for revision in revisions:
-
-        fix_task_id = f"fix_{revision}"
-        rev_key = f"{revision}_rev"
-
-        the_fix = ti.xcom_pull(task_id=fix_task_id)
-        if the_fix:
-            user_inputs[rev_key] = the_fix
+        sha = ti.xcom_pull(key=f"{revision}_sha")
+        if sha:
+            user_inputs[revision] = sha
 
     return user_inputs
 
@@ -110,9 +117,9 @@ with DAG(
 
     sources = parse_dag_run_conf()
 
-    parse_input = PythonOperator(
-        task_id="gen_github_apis",
-        python_callable=gen_github_apis,
+    repo_endpoints = PythonOperator(
+        task_id="gen_github_endpoints",
+        python_callable=gen_github_endpoints,
         op_args=[sources],
     )
 
@@ -120,31 +127,30 @@ with DAG(
         task_id="solidify_params",
         python_callable=solidify_params,
         trigger_rule=TriggerRule.NONE_FAILED,
+        op_args=[sources],
     )
 
     with TaskGroup("get_branch_info") as get_branch_info:
 
         for revision in revisions:
-            repo = revision.split("_")[0]
 
-            # "latest" -> "a6ff88b"
-            fix = SimpleHttpOperator(
-                task_id=f"fix_{revision}",
+            # requires HTTP connection: api.github.com
+            # called: http_default
+            ask_github = SimpleHttpOperator(
+                task_id=f"ask_github_{revision}",
                 method="GET",
-                http_conn_id="project_branch_conn",
-                endpoint=f"{{{{ ti.xcom_pull(key='{repo}_api') }}}}",
+                endpoint=f"{{{{ ti.xcom_pull(task_ids='{repo_endpoints.task_id}')['{revision}'] }}}}",
                 headers={"Authorization": "bearer {{ var.value.GITHUB_ACCESS_TOKEN }}"},
                 do_xcom_push=True,
             )
 
-            dont_fix = DummyOperator(task_id=f"leave_{revision}")
-
-            # "a6ff88b" -> do nothing
-            # "latest" -> execute fix
-            maybe_fix = BranchPythonOperator(
-                task_id=f"maybe_fix_{revision}",
-                python_callable=maybe_dereference_rev,
-                op_args=[sources, revision],
+            to_sha1 = PythonOperator(
+                task_id=f"getsha1_{revision}",
+                python_callable=branch_to_sha1,
+                op_args=[
+                    revision,
+                    f"{{{{ ti.xcom_pull(task_ids='{ask_github.task_id}') }}}}",
+                ],
             )
 
-            parse_input >> maybe_fix >> [fix, dont_fix] >> solidify_params
+            repo_endpoints >> ask_github >> to_sha1 >> solidify_params
